@@ -316,7 +316,7 @@ size_t host_memory_backend_pagesize(HostMemoryBackend *memdev)
 
 static void
 host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
-{
+{   
     HostMemoryBackend *backend = MEMORY_BACKEND(uc);
     HostMemoryBackendClass *bc = MEMORY_BACKEND_GET_CLASS(uc);
     Error *local_err = NULL;
@@ -339,6 +339,34 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
             qemu_madvise(ptr, sz, QEMU_MADV_DONTDUMP);
         }
 #ifdef CONFIG_NUMA
+#define CONFIG_CXLMU
+#define CXLMU_LOCAL_NUMA 2
+#define CXLMU_EMC_NUMA 3
+#ifdef CONFIG_CXLMU
+        // Hack to expose "CXL region" in GPA
+        unsigned long local_nodemask = (1UL << CXLMU_LOCAL_NUMA);
+        unsigned long emc_nodemask = (1UL << CXLMU_EMC_NUMA);
+
+        // bind local portion of GPA
+        size_t pgsize = qemu_real_host_page_size();
+        uint64_t local_sz = ((sz/2)/pgsize)*pgsize; // TODO: Just setting to half of total GPA for now
+        assert(local_sz > 0);
+        if (mbind(ptr, local_sz, MPOL_BIND, &local_nodemask, sizeof(local_nodemask)*8,
+                  MPOL_MF_STRICT | MPOL_MF_MOVE)) {
+                error_setg_errno(errp, errno,
+                                 "CXLMU: cannot bind local portion of GPA");
+                return;
+        }
+
+        // bind second half of GPA to emc numa
+        if (mbind(ptr+local_sz, sz - local_sz, MPOL_BIND, &emc_nodemask, sizeof(emc_nodemask)*8,
+                  MPOL_MF_STRICT | MPOL_MF_MOVE)) {
+                error_setg_errno(errp, errno,
+                                 "CXLMU: cannot bind EMC portion of GPA");
+                return;
+        }
+
+#else        
         unsigned long lastbit = find_last_bit(backend->host_nodes, MAX_NODES);
         /* lastbit == MAX_NODES means maxnode = 0 */
         unsigned long maxnode = (lastbit + 1) % (MAX_NODES + 1);
@@ -378,6 +406,7 @@ host_memory_backend_memory_complete(UserCreatable *uc, Error **errp)
                 return;
             }
         }
+#endif
 #endif
         /* Preallocate memory after the NUMA policy has been instantiated.
          * This is necessary to guarantee memory is allocated with
